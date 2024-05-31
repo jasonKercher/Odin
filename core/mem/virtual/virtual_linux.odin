@@ -2,7 +2,10 @@
 //+private
 package mem_virtual
 
+import "base:runtime"
+
 import "core:mem"
+import "core:strconv"
 import "core:sys/linux"
 
 _reserve :: proc "contextless" (size: uint) -> (data: []byte, err: Allocator_Error) {
@@ -68,53 +71,121 @@ _map_file :: proc "contextless" (fd: uintptr, size: i64, flags: Map_File_Flags) 
 	return ([^]byte)(addr)[:size], nil
 }
 
-// unused
-_Page_Allocator_Platform_Data :: uintptr
+Huge_Page :: struct {
+	addr: rawptr,
+	page_size_in_4k: u32,
+	page_count: u32,
+}
+
+Page_Allocator_Platform_Data :: struct {
+	huge_pages: [dynamic]Huge_Page,
+}
 
 MMAP_FLAGS   : linux.Map_Flags      : {.ANONYMOUS, .PRIVATE}
 MMAP_PROT    : linux.Mem_Protection : {.READ, .WRITE}
 
-_page_allocator_aligned_alloc :: proc(size, alignment: int, flags: Page_Allocator_Flags) -> ([]byte, Allocator_Error) {
-	if size == 0 {
-		return nil, .Invalid_Argument
+HUGE_PAGE_SIZE_DEFAULT :: 2 * mem.Megabyte
+
+_set_system_large_page_count :: proc(count: int) -> (okay: bool) {
+	// Expect this to fail because of permissions. Sudo can't even do this.
+	fd, errno := linux.open("/proc/sys/vm/nr_hugepages", {.WRONLY, .TRUNC})
+	if errno != nil {
+		return false
 	}
-	aligned_size      := mem.align_forward_int(size, mem.DEFAULT_PAGE_SIZE)
-	aligned_alignment := mem.align_forward_int(alignment, mem.DEFAULT_PAGE_SIZE)
+	defer linux.close(fd)
 
-	mapping_size := aligned_size
+	buf: [24]u8
+	s := strconv.append_int(buf[:], i64(count), 10)
 
-	if alignment > mem.DEFAULT_PAGE_SIZE {
-		// Add extra pages
-		mapping_size += aligned_alignment - mem.DEFAULT_PAGE_SIZE
-	}
+	_, errno = linux.write(fd, buf[:len(s)])
+	return errno == nil
+}
 
-	flags: linux.Map_Flags = MMAP_FLAGS
+_page_allocator_init :: proc(allocator: ^Page_Allocator, flags: Page_Allocator_Flags) {
+	raw_array := (^runtime.Raw_Dynamic_Array)(&allocator.platform.huge_pages)
+	raw_array.allocator.procedure = page_allocator_proc
+}
+
+_page_aligned_alloc :: proc(size, align, offset_pages: int,
+			    flags: Page_Allocator_Flags, data: ^Page_Allocator_Platform_Data) -> ([]byte, Allocator_Error) {
+	aligned_size  := mem.align_forward_int(size, mem.DEFAULT_PAGE_SIZE)
+	aligned_align := mem.align_forward_int(align, mem.DEFAULT_PAGE_SIZE)
+
+	offset := offset_pages * mem.DEFAULT_PAGE_SIZE
 
 	// 1 GB *huge* page
-	if aligned_size >= 1 * mem.Gigabyte || alignment >= 1 * mem.Gigabyte {
-		raw_flags : i32 = transmute(i32)(MMAP_FLAGS) | i32(linux.MAP_HUGE_1GB)
-		flags = transmute(linux.Map_Flags)(raw_flags)
-		flags += {.HUGETLB}
-		if ptr, errno := linux.mmap(0, uint(aligned_size), MMAP_PROT, flags); ptr != nil && errno == nil {
-			g_last_was_large = true
-			g_head_waste = 0
-			g_tail_waste = 0
+	if .Allow_Large_Pages in flags && offset == 0 && size >= 1 * mem.Gigabyte {
+		raw_map_flags : i32 = transmute(i32)(MMAP_FLAGS) | i32(linux.MAP_HUGE_1GB)
+		map_flags := transmute(linux.Map_Flags)(raw_map_flags)
+		map_flags += {.HUGETLB}
+
+		aligned_1gb_size := mem.align_forward_int(aligned_size, 1 * mem.Gigabyte)
+		if ptr, errno := linux.mmap(0, uint(aligned_1gb_size), MMAP_PROT, map_flags); ptr != nil && errno == nil {
+			if data != nil {
+				huge_page := Huge_Page {
+					addr = ptr,
+					page_size_in_4k = u32((1 * mem.Gigabyte) / (4 * mem.Kilobyte)),
+					page_count = u32(aligned_1gb_size / (1 * mem.Gigabyte)),
+				}
+				append(&data.huge_pages, huge_page)
+			}
 			return mem.byte_slice(ptr, size), nil
 		}
 	}
+
 	// 2 MB huge page
-	if aligned_size >= 2 * mem.Megabyte || alignment >= 2 * mem.Megabyte {
-		raw_flags : i32 = transmute(i32)(MMAP_FLAGS) | i32(linux.MAP_HUGE_2MB)
-		flags = transmute(linux.Map_Flags)(raw_flags)
-		flags += {.HUGETLB}
-		if ptr, errno := linux.mmap(0, uint(aligned_size), MMAP_PROT, flags); ptr != nil && errno == nil {
-			g_last_was_large = true
-			g_head_waste = 0
-			g_tail_waste = 0
+	attempt_2MB: if .Allow_Large_Pages in flags && offset == 0 && size >= HUGE_PAGE_SIZE_DEFAULT {
+		raw_map_flags : i32 = transmute(i32)(MMAP_FLAGS) | i32(linux.MAP_HUGE_2MB)
+		map_flags := transmute(linux.Map_Flags)(raw_map_flags)
+		map_flags += {.HUGETLB}
+
+		aligned_2mb_size  := mem.align_forward_int(aligned_size, HUGE_PAGE_SIZE_DEFAULT)
+		aligned_2mb_align := mem.align_forward_int(aligned_align, HUGE_PAGE_SIZE_DEFAULT)
+
+		mapping_size := aligned_2mb_size
+		if aligned_align > HUGE_PAGE_SIZE_DEFAULT {
+			mapping_size += aligned_2mb_align - HUGE_PAGE_SIZE_DEFAULT
+		}
+
+		ptr, errno := linux.mmap(0, uint(mapping_size), MMAP_PROT, map_flags)
+		if ptr == nil || errno != nil {
+			break attempt_2MB
+		}
+
+		huge_page := Huge_Page {
+			addr = ptr,
+			page_size_in_4k = u32(HUGE_PAGE_SIZE_DEFAULT / (4 * mem.Kilobyte)),
+			page_count = u32(aligned_2mb_size / HUGE_PAGE_SIZE_DEFAULT),
+		}
+		defer if data != nil {
+			append(&data.huge_pages, huge_page)
+		}
+
+		if mapping_size == aligned_2mb_size {
 			return mem.byte_slice(ptr, size), nil
 		}
+
+		aligned_addr := mem.align_forward_int(int(uintptr(ptr)), aligned_2mb_align)
+		base_waste := aligned_addr - int(uintptr(ptr))
+		end_waste  := (aligned_2mb_align - HUGE_PAGE_SIZE_DEFAULT) - base_waste
+		if base_waste > 0 {
+			linux.munmap(ptr, uint(base_waste))
+		}
+		if end_waste > 0 {
+			linux.munmap(rawptr(uintptr(aligned_addr + aligned_2mb_size)), uint(end_waste))
+		}
+
+		huge_page.addr = rawptr(uintptr(aligned_addr))
+		return mem.byte_slice(rawptr(uintptr(aligned_addr)), size), nil
 	}
-	g_last_was_large = false
+
+	mapping_size := aligned_size
+	if align > mem.DEFAULT_PAGE_SIZE {
+		// Add extra pages
+		mapping_size += aligned_align - mem.DEFAULT_PAGE_SIZE
+	}
+	mapping_size -= offset
+
 	ptr, errno := linux.mmap(0, uint(mapping_size), MMAP_PROT, MMAP_FLAGS)
 	if errno != nil || ptr == nil {
 		return nil, .Out_Of_Memory
@@ -123,91 +194,139 @@ _page_allocator_aligned_alloc :: proc(size, alignment: int, flags: Page_Allocato
 	// If these don't match, we added extra for alignment.
 	// Find the correct alignment, and unmap the waste.
 	if aligned_size != mapping_size {
-		aligned_ptr := mem.align_forward_uintptr(uintptr(ptr), uintptr(aligned_alignment))
+		aligned_addr := mem.align_forward_int(int(uintptr(ptr)), aligned_align)
+		base_addr    := aligned_addr + offset
 
-		g_head_waste = int(aligned_ptr - uintptr(ptr))
-		g_tail_waste = (aligned_alignment - mem.DEFAULT_PAGE_SIZE) - g_head_waste
-		if g_head_waste > 0 {
-			linux.munmap(ptr, uint(g_head_waste))
+		base_waste := base_addr - int(uintptr(ptr))
+		end_waste  := (aligned_align - mem.DEFAULT_PAGE_SIZE) - base_waste
+		if base_waste > 0 {
+			linux.munmap(ptr, uint(base_waste))
 		}
-		if g_tail_waste > 0 {
-			linux.munmap(rawptr(aligned_ptr + uintptr(aligned_size)), uint(g_tail_waste))
+		if end_waste > 0 {
+			linux.munmap(rawptr(uintptr(aligned_addr) + uintptr(aligned_size)), uint(end_waste))
 		}
-		ptr = rawptr(aligned_ptr)
+		ptr = rawptr(uintptr(base_addr))
 	}
 	return mem.byte_slice(ptr, size), nil
 }
 
-_page_allocator_aligned_resize :: proc(old_ptr: rawptr,
-	                               old_size, new_size, new_align: int,
-				       flags: Page_Allocator_Flags) -> (new_memory: []byte, err: Allocator_Error) {
-	if old_ptr == nil {
-		return nil, nil
-	}
-	if !page_aligned(old_ptr) {
+_page_aligned_resize :: proc(old_ptr: rawptr,
+			     old_size, new_size, new_align, offset_pages: int,
+			     flags: Page_Allocator_Flags, data: ^Page_Allocator_Platform_Data) -> (new_memory: []byte, err: Allocator_Error) {
+	if old_ptr == nil || !page_aligned(old_ptr) {
 		return nil, .Invalid_Pointer
 	}
-	new_ptr: rawptr
+
+	old_align := mem.DEFAULT_PAGE_SIZE
+	hp_idx    := _get_huge_page_idx(data, old_ptr)
+	if hp_idx != -1 {
+		old_align *= int(data.huge_pages[hp_idx].page_size_in_4k)
+	}
 
 	new_align := new_align
 
-	aligned_size      := mem.align_forward_int(new_size, mem.DEFAULT_PAGE_SIZE)
-	aligned_alignment := mem.align_forward_int(new_align, mem.DEFAULT_PAGE_SIZE)
+	aligned_old_size := mem.align_forward_int(old_size, old_align)
+	aligned_new_size  := mem.align_forward_int(new_size, mem.DEFAULT_PAGE_SIZE)
+	aligned_new_align := mem.align_forward_int(new_align, mem.DEFAULT_PAGE_SIZE)
 
-	// If we meet all our alignment requirements or we're not allowed to move,
-	// we may be able to get away with doing nothing at all or growing in place.
-	errno: linux.Errno
-	if .Unmovable_Pages in flags || ((uintptr(aligned_alignment) - 1) & uintptr(old_ptr)) == 0 {
-		if aligned_size == mem.align_forward_int(old_size, mem.DEFAULT_PAGE_SIZE) {
-			return mem.byte_slice(old_ptr, old_size), nil
+	if .Static_Pages in flags || ((uintptr(aligned_new_align) - 1) & uintptr(old_ptr)) == 0 {
+		return_slice := mem.byte_slice(old_ptr, new_size)
+		if aligned_old_size == mem.align_forward_int(new_size, old_align){
+			if .Uninitialized_Memory not_in flags && new_size > old_size {
+				mem.zero_slice(return_slice[old_size:])
+			}
+			return return_slice, nil
 		}
 
-		new_ptr, errno = linux.mremap(old_ptr, uint(old_size) , uint(new_size), {.FIXED})
-		if new_ptr != nil && errno == nil {
-			return mem.byte_slice(new_ptr, new_size), nil
+		if _, errno := linux.mremap(old_ptr, uint(old_size), uint(new_size), {}); errno == nil {
+			if .Uninitialized_Memory not_in flags && new_size > old_size {
+				// zero the remainder of the *old* page
+				mem.zero_slice(return_slice[old_size:aligned_old_size])
+			}
+			if hp_idx != -1 {
+				_attempt_huge_page_collapse(old_ptr, new_size)
+			}
+			return return_slice, nil
 		}
-		if .Unmovable_Pages in flags {
+
+		if .Static_Pages in flags {
 			return mem.byte_slice(old_ptr, old_size), .Out_Of_Memory
 		}
 	}
 
-	// If you want greater than page size alignment (and we failed to expand in place above),
-	// send to aligned_alloc, manually copy the conents, and unmap the old mapping.
-	if aligned_alignment > mem.DEFAULT_PAGE_SIZE {
+	// mremap not currently supported for huge pages
+	if aligned_new_align > mem.DEFAULT_PAGE_SIZE {
 		new_bytes: []u8
 		new_align      = mem.align_forward_int(new_align, mem.DEFAULT_PAGE_SIZE)
-		new_bytes, err = _page_allocator_aligned_alloc(new_size, new_align, flags)
-		if new_bytes == nil || err != nil {
-			return mem.byte_slice(old_ptr, old_size), err == nil ? .Out_Of_Memory : err
+		new_bytes, err = page_aligned_alloc(new_size, new_align, offset_pages, flags, data)
+		if err != nil {
+			return mem.byte_slice(old_ptr, old_size), err
 		}
 
 		mem.copy_non_overlapping(&new_bytes[0], old_ptr, old_size)
-		linux.munmap(old_ptr, mem.align_forward_uint(uint(old_size), mem.DEFAULT_PAGE_SIZE))
+		linux.munmap(old_ptr, uint(aligned_old_size))
+		if hp_idx != -1 {
+			unordered_remove(&data.huge_pages, hp_idx)
+		}
 
 		return new_bytes[:new_size], nil
 	}
 
-	new_ptr, errno = linux.mremap(old_ptr,
-	                              mem.align_forward_uint(uint(old_size), mem.DEFAULT_PAGE_SIZE),
-	                              uint(aligned_size),
-	                              {.MAYMOVE})
+	new_ptr, errno := linux.mremap(old_ptr,
+	                               uint(aligned_old_size),
+	                               uint(aligned_new_size),
+	                               {.MAYMOVE})
 	if new_ptr == nil || errno != nil {
 		return nil, .Out_Of_Memory
 	}
+	_attempt_huge_page_collapse(new_ptr, new_size)
+
 	return mem.byte_slice(new_ptr, new_size), nil
 }
 
-_page_allocator_free :: proc(p: rawptr, size: int) -> Allocator_Error {
-	if p != nil && size >= 0 && page_aligned(p) {
-		aligned_size := mem.align_forward_uint(uint(size), mem.DEFAULT_PAGE_SIZE)
-		errno := linux.munmap(p, aligned_size)
-		return errno == nil ? nil : .Invalid_Pointer
+_page_free :: proc(p: rawptr, size: int,
+		   _: Page_Allocator_Flags, data: ^Page_Allocator_Platform_Data) -> Allocator_Error {
+	if p == nil || !page_aligned(p) {
+		return .Invalid_Pointer
 	}
-	return .Invalid_Argument
+	size := size
+
+	hp_idx := _get_huge_page_idx(data, p)
+	if hp_idx != -1 {
+		align := mem.DEFAULT_PAGE_SIZE * int(data.huge_pages[hp_idx].page_size_in_4k)
+		size = mem.align_forward_int(size, align)
+	}
+	return linux.munmap(p, uint(size)) == nil ? nil : .Invalid_Pointer
 }
 
-_set_system_large_page_count :: proc(count: int) -> (okay: bool) {
-	// TODO: write to /proc/sys/vm/nr_hugepages,
-	//       and expect to fail.
-	return false
+_get_huge_page_idx :: proc(data: ^Page_Allocator_Platform_Data, ptr: rawptr) -> int {
+	if data == nil {
+		return -1
+	}
+
+	for hp, i in data.huge_pages {
+		if hp.addr == ptr {
+			return i
+		}
+	}
+	return -1
+}
+
+_attempt_huge_page_collapse :: proc(addr: rawptr, size: int) {
+	// If we can fit the aligned section of this allocation into a huge page, try to.
+	// We do this in resize because the kernel expects at least one of the pages to be
+	// backed by physical memory. Otherwise, it fails with EINVAL.
+	if size < HUGE_PAGE_SIZE_DEFAULT {
+		return
+	}
+	aligned_size := mem.align_forward_int(size, HUGE_PAGE_SIZE_DEFAULT)
+	huge_page_addr := mem.align_forward(addr, HUGE_PAGE_SIZE_DEFAULT)
+	huge_page_size := uintptr(aligned_size) - (uintptr(huge_page_addr) - uintptr(addr))
+	if huge_page_size < HUGE_PAGE_SIZE_DEFAULT {
+		return
+	}
+
+	// This is purely an optimization that attempts to use Transparent Huge Pages (THPs).
+	// THPs have the same semantics as regular 4K pages so we don't need to track them.
+	_ = linux.madvise(huge_page_addr, uint(huge_page_size), .COLLAPSE)
 }

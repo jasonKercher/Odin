@@ -296,13 +296,8 @@ sched_yield :: proc "contextless" () {
 	Available since Linux 2.0.
 */
 mremap :: proc "contextless" (old_addr: rawptr, old_size: uint, new_size: uint, flags: MRemap_Flags, new_addr: uintptr = 0) -> (rawptr, Errno) {
-	if .FIXED in flags {
-		ret := syscall(SYS_mremap, old_addr, old_size, new_size, transmute(i32) flags, new_addr)
-		return errno_unwrap(ret, rawptr, rawptr)
-	} else {
-		ret := syscall(SYS_mremap, old_addr, old_size, new_size, transmute(i32) flags)
-		return errno_unwrap(ret, rawptr, rawptr)
-	}
+	ret := syscall(SYS_mremap, old_addr, old_size, new_size, transmute(i32) flags, new_addr)
+	return errno_unwrap(ret, rawptr, rawptr)
 }
 
 /*
