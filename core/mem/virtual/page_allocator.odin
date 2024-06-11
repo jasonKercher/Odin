@@ -3,7 +3,8 @@ package mem_virtual
 import "core:mem"
 
 Page_Allocator_Flag :: enum {
-	Static_Pages,
+	Fixed,
+	Never_Free,
 	Allow_Large_Pages,
 	Uninitialized_Memory,
 }

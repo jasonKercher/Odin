@@ -229,7 +229,7 @@ _page_aligned_resize :: proc(old_ptr: rawptr,
 	aligned_new_size  := mem.align_forward_int(new_size, mem.DEFAULT_PAGE_SIZE)
 	aligned_new_align := mem.align_forward_int(new_align, mem.DEFAULT_PAGE_SIZE)
 
-	if .Static_Pages in flags || ((uintptr(aligned_new_align) - 1) & uintptr(old_ptr)) == 0 {
+	if .Fixed in flags || ((uintptr(aligned_new_align) - 1) & uintptr(old_ptr)) == 0 {
 		return_slice := mem.byte_slice(old_ptr, new_size)
 		if aligned_old_size == mem.align_forward_int(new_size, old_align){
 			if .Uninitialized_Memory not_in flags && new_size > old_size {
@@ -249,13 +249,13 @@ _page_aligned_resize :: proc(old_ptr: rawptr,
 			return return_slice, nil
 		}
 
-		if .Static_Pages in flags {
+		if .Fixed in flags {
 			return mem.byte_slice(old_ptr, old_size), .Out_Of_Memory
 		}
 	}
 
 	// mremap not currently supported for huge pages
-	if aligned_new_align > mem.DEFAULT_PAGE_SIZE {
+	if .Never_Free in flags || aligned_new_align > mem.DEFAULT_PAGE_SIZE {
 		new_bytes: []u8
 		new_align      = mem.align_forward_int(new_align, mem.DEFAULT_PAGE_SIZE)
 		new_bytes, err = page_aligned_alloc(new_size, new_align, offset_pages, flags, data)
@@ -264,9 +264,11 @@ _page_aligned_resize :: proc(old_ptr: rawptr,
 		}
 
 		mem.copy_non_overlapping(&new_bytes[0], old_ptr, old_size)
-		linux.munmap(old_ptr, uint(aligned_old_size))
-		if hp_idx != -1 {
-			unordered_remove(&data.huge_pages, hp_idx)
+		if .Never_Free not_in flags {
+			linux.munmap(old_ptr, uint(aligned_old_size))
+			if hp_idx != -1 {
+				unordered_remove(&data.huge_pages, hp_idx)
+			}
 		}
 
 		return new_bytes[:new_size], nil
@@ -285,9 +287,12 @@ _page_aligned_resize :: proc(old_ptr: rawptr,
 }
 
 _page_free :: proc(p: rawptr, size: int,
-		   _: Page_Allocator_Flags, data: ^Page_Allocator_Platform_Data) -> Allocator_Error {
+		   flags: Page_Allocator_Flags, data: ^Page_Allocator_Platform_Data) -> Allocator_Error {
 	if p == nil || !page_aligned(p) {
 		return .Invalid_Pointer
+	}
+	if .Never_Free in flags {
+		return nil
 	}
 	size := size
 
